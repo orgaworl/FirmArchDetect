@@ -10,12 +10,12 @@ analysis, and ranks the candidates by structural confidence.
 - Requires `--base` for raw binaries.
 - Uses embedded addresses for HEX / S-record style files.
 - Scores candidates using:
-  - function count
-  - function start alignment
-  - function size sanity
-  - instruction density / invalid-code hints
-  - jump-target validity
-  - function cross-references
+    - function count
+    - function start alignment
+    - function size sanity
+    - instruction density / invalid-code hints
+    - jump-target validity
+    - function cross-references
 - Prints a ranked top-10 table by default.
 - Can emit the full JSON report with `--json`.
 
@@ -34,6 +34,38 @@ python .\detect_arch_rizin.py .\firmware.bin --base 0x00158000 --json
 python .\detect_arch_rizin.py .\firmware.bin --arch arm --arch v850 --arch tricore
 python .\detect_arch_rizin.py --list-arch
 ```
+
+## Examples
+
+- Detect architecture for a raw binary image:
+
+    ```powershell
+    python .\detect_arch_rizin.py .\firmware.bin --base 0x00158000
+    ```
+
+- Detect architecture for HEX-like firmware with embedded addresses:
+
+    ```powershell
+    python .\detect_arch_rizin.py .\firmware.hex
+    ```
+
+- Limit the search to common automotive MCU families:
+
+    ```powershell
+    python .\detect_arch_rizin.py .\firmware.bin --base 0x00158000 --arch arm --arch v850 --arch tricore
+    ```
+
+- Or pass them as a single comma-separated list:
+
+    ```powershell
+    python .\detect_arch_rizin.py .\firmware.bin --base 0x00158000 --arch arm,v850,tricore
+    ```
+
+- Print the candidate profile list:
+
+    ```powershell
+    python .\detect_arch_rizin.py --list-arch
+    ```
 
 ## Input rules
 
@@ -62,4 +94,3 @@ JSON output includes:
 
 This tool is heuristic. A high score does not guarantee the correct architecture.
 Use the result together with known memory maps, entry points, and manual review.
-

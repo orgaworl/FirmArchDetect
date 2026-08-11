@@ -8,7 +8,7 @@ data to satisfy consistently.
 """
 from __future__ import annotations
 
-import argparse
+import click
 import json
 import logging
 import math
@@ -208,6 +208,16 @@ def is_hex_like_input(path: Path) -> bool:
 
 def input_requires_base(path: Path) -> bool:
     return not is_hex_like_input(path)
+
+
+def parse_architectures_option(_ctx: click.Context, _param: click.Parameter, values: tuple[str, ...]) -> tuple[str, ...]:
+    architectures: list[str] = []
+    for value in values:
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                architectures.append(item)
+    return tuple(architectures)
 
 
 def profile_args(profile: ArchProfile) -> list[str]:
@@ -467,44 +477,41 @@ def print_ranked_table(results: list[ProbeResult], limit: int = 10) -> None:
     print(f"Selected architecture: {top_results[0].name}")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Try multiple automotive MCU architectures with Rizin and rank them by structural analysis confidence.")
-    parser.add_argument("firmware", type=Path, nargs="?", help="Raw firmware file to analyze")
-    parser.add_argument("-o", "--output", type=Path, help="Save the complete JSON report")
-    parser.add_argument("--rizin", default="rizin", help="Path to the Rizin executable")
-    parser.add_argument("--base", type=lambda value: int(value, 0), default=None, help="Firmware mapping base address; required for raw binary inputs")
-    parser.add_argument("--timeout", type=int, default=120, help="Maximum analysis time per architecture in seconds")
-    parser.add_argument("--analysis", choices=("aaa", "aaaa"), default="aaa", help="Rizin analysis depth; aaaa is slower but more aggressive")
-    parser.add_argument("--arch", action="append", dest="architectures", help="Test only the selected profile; repeatable")
-    parser.add_argument("--list-arch", action="store_true", help="List candidate architecture profiles and exit")
-    parser.add_argument("--json", action="store_true", help="Print the complete JSON report to the terminal")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s: %(message)s")
-    if args.list_arch:
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("firmware", required=False, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-o", "--output", type=click.Path(dir_okay=False, path_type=Path), help="Save the complete JSON report")
+@click.option("--rizin", default="rizin", show_default=True, help="Path to the Rizin executable")
+@click.option("--base", callback=lambda _ctx, _param, value: int(value, 0) if value is not None else None, default=None, metavar="ADDR", help="Firmware mapping base address; required for raw binary inputs")
+@click.option("--timeout", type=int, default=120, show_default=True, help="Maximum analysis time per architecture in seconds")
+@click.option("--analysis", type=click.Choice(("aaa", "aaaa")), default="aaa", show_default=True, help="Rizin analysis depth; aaaa is slower but more aggressive")
+@click.option("--arch", "architectures", multiple=True, callback=parse_architectures_option, help="Test only the selected profiles; repeatable or comma-separated.")
+@click.option("--list-arch", is_flag=True, help="List candidate architecture profiles and exit")
+@click.option("--json", "json_output", is_flag=True, help="Print the complete JSON report to the terminal")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
+def main(firmware: Path | None, output: Path | None, rizin: str, base: int | None, timeout: int, analysis: str, architectures: tuple[str, ...], list_arch: bool, json_output: bool, verbose: bool) -> None:
+    r"""Try multiple automotive MCU architectures with Rizin and rank them by structural analysis confidence."""
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format="%(levelname)s: %(message)s")
+    if list_arch:
         for profile in PROFILES:
-            print(f"{profile.name:10} arch={profile.arch:8} bits={profile.bits:2} cpu={profile.cpu or '-':10} align={profile.alignment} {profile.description}")
-        return 0
-    if args.firmware is None:
-        parser.error("A firmware file is required; use --list-arch to inspect candidate profiles.")
-    if not args.firmware.is_file():
-        parser.error(f"Firmware does not exist or is not a file: {args.firmware}")
-    if args.base is None and input_requires_base(args.firmware):
-        parser.error("Raw binary inputs require --base; HEX-like inputs may omit it.")
-    base = args.base
-    rizin = find_tool(args.rizin)
+            click.echo(f"{profile.name:10} arch={profile.arch:8} bits={profile.bits:2} cpu={profile.cpu or '-':10} align={profile.alignment} {profile.description}")
+        return
+    if firmware is None:
+        raise click.UsageError("A firmware file is required; use --list-arch to inspect candidate profiles.")
+    if base is None and input_requires_base(firmware):
+        raise click.BadParameter("Raw binary inputs require --base; HEX-like inputs may omit it.", param_hint="--base")
+    base_address = base
+    rizin_path = find_tool(rizin)
     selected = PROFILES
-    if args.architectures:
-        names = set(args.architectures)
+    if architectures:
+        names = set(architectures)
         selected = tuple(profile for profile in PROFILES if profile.name in names)
         unknown = names - {profile.name for profile in PROFILES}
         if unknown:
-            parser.error(f"Unknown architecture profile: {', '.join(sorted(unknown))}")
+            raise click.BadParameter(f"Unknown architecture profile: {', '.join(sorted(unknown))}", param_hint="--arch")
     if not selected:
-        parser.error("No architecture profiles selected.")
+        raise click.UsageError("No architecture profiles selected.")
 
-    results = [probe_profile(rizin, args.firmware, profile, base, args.timeout, args.analysis) for profile in selected]
+    results = [probe_profile(rizin_path, firmware, profile, base_address, timeout, analysis) for profile in selected]
     confidence(results)
     ranked = sorted(
         results,
@@ -514,25 +521,25 @@ def main() -> int:
     winner = next((item for item in ranked if item.status == "ok" and item.functions > 0), None)
     runner_up = next((item for item in ranked if item is not winner and item.status == "ok" and item.functions > 0), None)
     report = {
-        "firmware": str(args.firmware.resolve()),
-        "rizin": rizin,
-        "base": base,
-        "analysis": args.analysis,
+        "firmware": str(firmware.resolve()),
+        "rizin": rizin_path,
+        "base": base_address,
+        "analysis": analysis,
         "method": "weighted_confidence: function_count, alignment, function_size, instruction_density, jump_targets, function_xrefs, all normalized to 0..1",
         "winner": result_dict(winner) if winner else None,
         "winner_confidence_margin": round(winner.confidence - runner_up.confidence, 4) if winner and runner_up else None,
         "results": [result_dict(item) for item in ranked],
     }
-    if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+    if json_output:
+        click.echo(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print_ranked_table(ranked, limit=10)
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        LOG.info("Report written to %s", args.output)
-    return 0 if winner else 2
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        LOG.info("Report written to %s", output)
+
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

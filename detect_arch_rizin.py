@@ -412,6 +412,31 @@ def analysis_seed_commands(profile: ArchProfile, firmware: Path, base: int | Non
     return commands
 
 
+def arm_vector_table_candidates(path: Path, base: int | None) -> list[int]:
+    if base is None:
+        return []
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    if len(data) < 0x20:
+        return []
+    words = [int.from_bytes(data[index:index + 4], "little") for index in range(0, min(len(data), 0x40), 4) if index + 4 <= len(data)]
+    if len(words) < 2:
+        return []
+    reset_vector = words[1]
+    if reset_vector & 1 == 0 or reset_vector < base:
+        return []
+    reset_addr = reset_vector & ~1
+    candidates = [reset_addr]
+    for word in words[2:8]:
+        if word & 1 and word >= base:
+            entry = word & ~1
+            if entry not in candidates:
+                candidates.append(entry)
+    return candidates
+
+
 def probe_profile(
     rizin: str,
     firmware: Path,
@@ -421,23 +446,66 @@ def probe_profile(
     analysis_command: str,
 ) -> ProbeResult:
     result = ProbeResult(profile.name, profile.arch, profile.bits, profile.cpu, profile.endian)
-    command = [rizin, "-q", *profile_args(profile)]
-    if base is not None:
-        command.extend(["-m", f"{base:#x}"])
-    seed_commands = analysis_seed_commands(profile, firmware, base)
-    analysis_prefix = ";".join([*seed_commands, analysis_command]) if seed_commands else analysis_command
-    command.extend(["-c", f"{analysis_prefix};aflj;axlj", str(firmware)])
-    LOG.info("Analyzing %-14s arch=%s bits=%s", profile.name, profile.arch, profile.bits)
-    try:
-        completed = run_command(command, timeout)
-    except subprocess.TimeoutExpired:
-        result.error = f"timeout after {timeout}s"
-        return result
-    if completed.returncode != 0:
-        result.error = (completed.stderr or completed.stdout).strip()[-1000:]
+    candidate_seeks: list[int | None] = [None]
+    if profile.arch == "arm" and profile.bits == 16 and profile.cpu == "thumb":
+        candidate_seeks = arm_vector_table_candidates(firmware, base) or [None]
+
+    best_completed: subprocess.CompletedProcess[str] | None = None
+    best_json_values: list[Any] = []
+    best_functions: list[dict[str, Any]] = []
+    best_refs: list[dict[str, Any]] = []
+    best_score = -1.0
+
+    for seek in candidate_seeks:
+        command = [rizin, "-q", *profile_args(profile)]
+        if base is not None:
+            command.extend(["-m", f"{base:#x}"])
+        seed_commands = analysis_seed_commands(profile, firmware, base)
+        if seek is not None:
+            seed_commands = [*seed_commands, f"s 0x{seek:x}", "af+ entry"]
+        analysis_prefix = ";".join([*seed_commands, analysis_command]) if seed_commands else analysis_command
+        command.extend(["-c", f"{analysis_prefix};aflj;axlj", str(firmware)])
+        LOG.info("Analyzing %-14s arch=%s bits=%s", profile.name, profile.arch, profile.bits)
+        try:
+            completed = run_command(command, timeout)
+        except subprocess.TimeoutExpired:
+            continue
+        if completed.returncode != 0:
+            continue
+
+        json_values = extract_json_values(completed.stdout)
+        function_list = next(
+            (
+                value
+                for value in json_values
+                if isinstance(value, list)
+                and (not value or isinstance(value[0], dict) and ("offset" in value[0] or "name" in value[0]) and "size" in value[0])
+            ),
+            None,
+        )
+        if function_list is None:
+            try:
+                function_list = parse_json_output(completed.stdout)
+            except ValueError:
+                continue
+        if not isinstance(function_list, list):
+            continue
+        functions = [item for item in function_list if isinstance(item, dict)]
+        xref_list = next((normalize_refs(value) for value in json_values if normalize_refs(value) and value is not function_list), [])
+        refs = xref_list + collect_function_refs(functions)
+        score = len(functions)
+        if score > best_score:
+            best_score = float(score)
+            best_completed = completed
+            best_json_values = json_values
+            best_functions = functions
+            best_refs = refs
+
+    if best_completed is None:
+        result.error = f"timeout after {timeout}s" if candidate_seeks != [None] else "analysis failed"
         return result
 
-    json_values = extract_json_values(completed.stdout)
+    json_values = best_json_values
     function_list = next(
         (
             value
@@ -449,17 +517,16 @@ def probe_profile(
     )
     if function_list is None:
         try:
-            function_list = parse_json_output(completed.stdout)
+            function_list = parse_json_output(best_completed.stdout)
         except ValueError as exc:
-            result.error = f"{exc}; stderr={completed.stderr.strip()[-500:]}"
+            result.error = f"{exc}; stderr={best_completed.stderr.strip()[-500:]}"
             return result
     if not isinstance(function_list, list):
         result.error = "aflj returned non-list JSON"
         return result
 
-    functions = [item for item in function_list if isinstance(item, dict)]
-    xref_list = next((normalize_refs(value) for value in json_values if normalize_refs(value) and value is not function_list), [])
-    refs = xref_list + collect_function_refs(functions)
+    functions = best_functions or [item for item in function_list if isinstance(item, dict)]
+    refs = best_refs or next((normalize_refs(value) for value in json_values if normalize_refs(value) and value is not function_list), []) + collect_function_refs(functions)
 
     result.functions = len(functions)
     result.basic_blocks = sum(max(0, int_value(item.get("nbbs"))) for item in functions)

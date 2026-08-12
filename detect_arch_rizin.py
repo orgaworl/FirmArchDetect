@@ -390,26 +390,26 @@ def score_functions(profile: ArchProfile, result: ProbeResult, functions: list[d
     )
 
 
-def seed_arm_reset_vector(rizin: str, firmware: Path, profile: ArchProfile, base: int | None) -> None:
-    if profile.arch != "arm" or profile.bits != 16 or profile.cpu != "thumb" or base is None:
-        return
+def read_reset_vector_from_binary(path: Path) -> int | None:
     try:
-        first_bytes = firmware.read_bytes()[:8]
+        first_bytes = path.read_bytes()[:8]
     except OSError:
-        return
+        return None
     if len(first_bytes) < 8:
-        return
+        return None
     reset_vector = int.from_bytes(first_bytes[4:8], "little")
     if reset_vector & 1 == 0:
-        return
-    reset_addr = reset_vector & ~1
-    if reset_addr < base:
-        return
-    command = [rizin, "-q", *profile_args(profile), "-c", f"s 0x{reset_addr:x}; af+ reset; q", str(firmware)]
-    try:
-        run_command(command, 20)
-    except subprocess.TimeoutExpired:
-        return
+        return None
+    return reset_vector & ~1
+
+
+def analysis_seed_commands(profile: ArchProfile, firmware: Path, base: int | None) -> list[str]:
+    commands: list[str] = []
+    if profile.arch == "arm" and profile.bits == 16 and profile.cpu == "thumb" and base is not None:
+        reset_addr = read_reset_vector_from_binary(firmware)
+        if reset_addr is not None and reset_addr >= base:
+            commands.append(f"s 0x{reset_addr:x}; af+ reset")
+    return commands
 
 
 def probe_profile(
@@ -423,8 +423,10 @@ def probe_profile(
     result = ProbeResult(profile.name, profile.arch, profile.bits, profile.cpu, profile.endian)
     command = [rizin, "-q", *profile_args(profile)]
     if base is not None:
-        command.extend(["-m", f"{base:#x}", "-s", f"{base:#x}"])
-    command.extend(["-c", f"{analysis_command};aflj;axlj", str(firmware)])
+        command.extend(["-m", f"{base:#x}"])
+    seed_commands = analysis_seed_commands(profile, firmware, base)
+    analysis_prefix = ";".join([*seed_commands, analysis_command]) if seed_commands else analysis_command
+    command.extend(["-c", f"{analysis_prefix};aflj;axlj", str(firmware)])
     LOG.info("Analyzing %-14s arch=%s bits=%s", profile.name, profile.arch, profile.bits)
     try:
         completed = run_command(command, timeout)
@@ -571,9 +573,6 @@ def main(firmware: Path | None, output: Path | None, rizin: str, base: int | Non
         raise click.UsageError("No architecture profiles selected.")
 
     ordered = sorted(selected, key=profile_priority)
-    for profile in ordered:
-        seed_arm_reset_vector(rizin_path, firmware, profile, base_address)
-
     results = [probe_profile(rizin_path, firmware, profile, base_address, timeout, analysis) for profile in ordered]
     confidence(results)
     ranked = sorted(

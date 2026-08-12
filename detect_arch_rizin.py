@@ -220,12 +220,49 @@ def parse_architectures_option(_ctx: click.Context, _param: click.Parameter, val
     return tuple(architectures)
 
 
+def architecture_priority(name: str) -> int:
+    return {
+        "arm": 0,
+        "v850": 1,
+        "tricore": 2,
+        "ppc": 3,
+        "mips": 4,
+        "sh": 5,
+        "rx": 6,
+        "rl78": 7,
+        "m68k": 8,
+        "avr": 9,
+        "8051": 10,
+        "cr16": 11,
+        "cris": 12,
+        "h8300": 13,
+        "m680x": 14,
+        "mcs96": 15,
+        "msp430": 16,
+        "nios2": 17,
+        "riscv": 18,
+        "sparc": 19,
+        "v810": 20,
+        "xtensa": 21,
+        "xcore": 22,
+        "z80": 23,
+    }.get(name, 99)
+
+
+def profile_priority(profile: ArchProfile) -> tuple[int, int, int]:
+    return (
+        architecture_priority(profile.name),
+        0 if profile.arch == "arm" and profile.bits == 16 and profile.cpu == "thumb" else 1,
+        profile.bits,
+    )
+
+
 def profile_args(profile: ArchProfile) -> list[str]:
-    args = ["-a", profile.arch, "-b", str(profile.bits)]
+    args = ["-a", profile.arch, "-b", str(profile.bits), "-e", "io.va=true"]
     if profile.cpu:
         args.extend(["-e", f"asm.cpu={profile.cpu}"])
     if profile.endian:
-        args.extend(["-e", f"cfg.bigendian={'true' if profile.endian == 'big' else 'false'}"])
+        args.extend(["-E", profile.endian])
     return args
 
 
@@ -347,10 +384,32 @@ def score_functions(profile: ArchProfile, result: ProbeResult, functions: list[d
     result.structural_score = (
         result.alignment_score * 0.20
         + result.size_score * 0.20
-        + result.instruction_score * 0.25
+        + result.instruction_score * 0.30
         + result.jump_target_score * 0.20
         + result.xref_score * 0.15
     )
+
+
+def seed_arm_reset_vector(rizin: str, firmware: Path, profile: ArchProfile, base: int | None) -> None:
+    if profile.arch != "arm" or profile.bits != 16 or profile.cpu != "thumb" or base is None:
+        return
+    try:
+        first_bytes = firmware.read_bytes()[:8]
+    except OSError:
+        return
+    if len(first_bytes) < 8:
+        return
+    reset_vector = int.from_bytes(first_bytes[4:8], "little")
+    if reset_vector & 1 == 0:
+        return
+    reset_addr = reset_vector & ~1
+    if reset_addr < base:
+        return
+    command = [rizin, "-q", *profile_args(profile), "-c", f"s 0x{reset_addr:x}; af+ reset; q", str(firmware)]
+    try:
+        run_command(command, 20)
+    except subprocess.TimeoutExpired:
+        return
 
 
 def probe_profile(
@@ -422,7 +481,7 @@ def confidence(results: list[ProbeResult]) -> None:
             item.function_count_score * 0.20
             + item.alignment_score * 0.15
             + item.size_score * 0.15
-            + item.instruction_score * 0.20
+            + item.instruction_score * 0.30
             + item.jump_target_score * 0.15
             + item.xref_score * 0.15
         )
@@ -511,11 +570,15 @@ def main(firmware: Path | None, output: Path | None, rizin: str, base: int | Non
     if not selected:
         raise click.UsageError("No architecture profiles selected.")
 
-    results = [probe_profile(rizin_path, firmware, profile, base_address, timeout, analysis) for profile in selected]
+    ordered = sorted(selected, key=profile_priority)
+    for profile in ordered:
+        seed_arm_reset_vector(rizin_path, firmware, profile, base_address)
+
+    results = [probe_profile(rizin_path, firmware, profile, base_address, timeout, analysis) for profile in ordered]
     confidence(results)
     ranked = sorted(
         results,
-        key=lambda item: (item.confidence, item.score, item.structural_score, item.functions),
+        key=lambda item: (item.confidence, item.score, item.structural_score, item.functions, -architecture_priority(item.name)),
         reverse=True,
     )
     winner = next((item for item in ranked if item.status == "ok" and item.functions > 0), None)
